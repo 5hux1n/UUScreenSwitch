@@ -1,31 +1,19 @@
-// UUScreenSwitch — UU远程 4.42.0 (build 193)
+// UUScreenSwitch — UU远程多显示器快捷切换插件
 //
 // 把远控页底部工具栏的「展开所有窗口」「显示桌面」替换为「显示器1」「显示器2」，
 // 点击直接切换被控端显示屏，等价于 操作 → 显示 → 多显示屏管理 里点选对应屏幕。
-//
-// 逆向链路（4.42.0）：
-//   ToolsScreenDisplayViewViewController 的多屏菜单点选回调
-//     → controlViewModel.session.screenInfos[index]
-//     → ControlPanelViewModel.switchScreen(_: StreamerScreenSourceModel)   @ 0x10081a1f0
-//   本插件走完全相同的调用：self = ControlPanelViewModel（x20），x0 = 屏幕对象。
-//   不直接调 RemoteConnectionSession 的内部方法，切屏后的状态/埋点都由 App 自己处理。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <string.h>
 
 #define UULog(fmt, ...) NSLog(@"[UUScreenSwitch] " fmt, ##__VA_ARGS__)
 
 extern void uuss_call_swift_method(void *fn, void *swiftSelf, void *arg0);
 
-// ---- 4.42.0 常量 -------------------------------------------------------------
-
-static NSString *const kTargetVersion = @"4.42.0";
-// ControlPanelViewModel.switchScreen(_:) 相对 __TEXT（mach header）的偏移
-static const uintptr_t kSwitchScreenOffset = 0x81a1f0;
-// 入口前 8 字节：sub sp,sp,#0x110 ; stp x26,x25,[sp,#0xc0]
-static const uint8_t kSwitchScreenPrologue[8] = {0xff, 0x43, 0x04, 0xd1, 0xfa, 0x67, 0x0c, 0xa9};
+// ---- 常量 -------------------------------------------------------------------
 
 // RemoteToolBarItemType（Swift 无关联值枚举，按声明顺序编号）
 static const uint8_t kItemTypeShowDesktop      = 3;
@@ -41,6 +29,28 @@ static char kAssocDisplayIndex;   // NSNumber: 0 / 1 / -1(不处理)
 
 static IMP sOrigLayout   = NULL;
 static IMP sOrigDidClick = NULL;
+
+static Class UUItemClass(void) {
+    static Class cls = Nil;
+    if (cls) return cls;
+    cls = objc_getClass(kClsItem);
+    if (cls) return cls;
+    cls = objc_getClass("_TtC14nrd_ios_client17RemoteToolBarItem");
+    if (cls) return cls;
+    unsigned int count = 0;
+    Class *list = objc_copyClassList(&count);
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = class_getName(list[i]);
+        if (!name || strncmp(name, "_TtC14nrd_ios_client", 20) != 0) continue;
+        size_t len = strlen(name);
+        if (len >= 19 && strcmp(name + len - 19, "17RemoteToolBarItem") == 0) {
+            cls = list[i];
+            break;
+        }
+    }
+    free(list);
+    return cls;
+}
 
 // ---- 通用工具 ----------------------------------------------------------------
 
@@ -135,7 +145,40 @@ static id UUFindViewModel(UIView *from) {
     return nil;
 }
 
-// ---- 切屏 ------------------------------------------------------------------
+// ---- 切屏（通过 Swift 虚表动态定位，不限制 App 版本） ----------------------
+
+// 检查函数入口前 24 条指令是否在 x1 上加载了 @selector(screen_id)
+// ControlPanelViewModel.switchScreen(_: StreamerScreenSourceModel) 入口立即取参数 x0.screen_id
+static BOOL UUFunctionLoadsScreenIDSel(const uint32_t *insns, uintptr_t imageStart, uintptr_t imageEnd) {
+    SEL targetSel = sel_registerName("screen_id");
+    uintptr_t adrpPages[32] = {0};
+    for (int i = 0; i < 24; i++) {
+        uint32_t insn = insns[i];
+        uintptr_t pc = (uintptr_t)&insns[i];
+        if ((insn & 0x9f000000u) == 0x90000000u) {
+            uint32_t rd = insn & 0x1fu;
+            int64_t immlo = (insn >> 29) & 0x3;
+            int64_t immhi = (insn >> 5) & 0x7ffff;
+            int64_t imm = (immhi << 2) | immlo;
+            if (imm & (1LL << 20)) imm -= (1LL << 21);
+            adrpPages[rd] = (pc & ~0xfffULL) + (uintptr_t)(imm << 12);
+        } else if ((insn & 0xffc00000u) == 0xf9400000u) {
+            uint32_t rt = insn & 0x1fu;
+            uint32_t rn = (insn >> 5) & 0x1fu;
+            uint32_t imm12 = ((insn >> 10) & 0xfffu) * 8u;
+            if (rt == 1 && adrpPages[rn] != 0) {
+                uintptr_t selRefAddr = adrpPages[rn] + imm12;
+                if (selRefAddr >= imageStart && selRefAddr + sizeof(SEL) <= imageEnd) {
+                    SEL loaded = *(SEL *)selRefAddr;
+                    if (loaded == targetSel) return YES;
+                }
+            }
+        } else if (insn == 0xd65f03c0u) {
+            break;
+        }
+    }
+    return NO;
+}
 
 static void *UUSwitchScreenFunction(void) {
     static void *fn = NULL;
@@ -143,35 +186,63 @@ static void *UUSwitchScreenFunction(void) {
     if (resolved) return fn;
     resolved = YES;
 
-    NSString *ver = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"];
-    if (![ver isEqualToString:kTargetVersion]) {
-        UULog(@"version mismatch: %@", ver);
-        return NULL;
-    }
-    const struct mach_header *mh = NULL;
+    const struct mach_header_64 *mh = NULL;
+    intptr_t slide = 0;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
         size_t len = name ? strlen(name) : 0;
         if (len >= 15 && strcmp(name + len - 15, "/nrd-ios-client") == 0) {
-            mh = _dyld_get_image_header(i);
+            mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            slide = _dyld_get_image_vmaddr_slide(i);
             break;
         }
     }
     if (!mh) { UULog(@"main image not found"); return NULL; }
-    uint8_t *p = (uint8_t *)mh + kSwitchScreenOffset;
-    if (memcmp(p, kSwitchScreenPrologue, sizeof(kSwitchScreenPrologue)) != 0) {
-        UULog(@"prologue mismatch at %p", p);
-        return NULL;
+
+    uintptr_t textStart = (uintptr_t)mh;
+    uintptr_t textEnd = textStart + 0x02600000ULL;
+    uintptr_t imageEnd = textStart + 0x04000000ULL;
+    const uint8_t *cmdPtr = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmdPtr;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                textStart = (uintptr_t)(seg->vmaddr + slide);
+                textEnd = textStart + (uintptr_t)seg->vmsize;
+            } else if (strcmp(seg->segname, "__LINKEDIT") != 0 && seg->vmsize > 0) {
+                uintptr_t segEnd = (uintptr_t)(seg->vmaddr + slide) + (uintptr_t)seg->vmsize;
+                if (segEnd > imageEnd) imageEnd = segEnd;
+            }
+        }
+        cmdPtr += lc->cmdsize;
     }
-    fn = p;
-    return fn;
+
+    // 从 ControlPanelViewModel 的 Swift 类元数据虚表中动态扫描 switchScreen(_:)
+    Class vmCls = objc_getClass(kClsViewModel);
+    if (vmCls) {
+        uintptr_t *words = (uintptr_t *)(__bridge void *)vmCls;
+        for (size_t off = 0x50 / sizeof(uintptr_t); off < 0x1000 / sizeof(uintptr_t); off++) {
+            uintptr_t raw = words[off];
+            uintptr_t candidate = raw & 0x0000ffffffffffffULL;
+            if (candidate >= textStart + 0x4000 && candidate + 96 < textEnd && (candidate & 0x3) == 0) {
+                if (UUFunctionLoadsScreenIDSel((const uint32_t *)candidate, textStart, imageEnd)) {
+                    fn = (void *)candidate;
+                    UULog(@"resolved switchScreen via vtable[+0x%zx] = %p", off * sizeof(uintptr_t), fn);
+                    return fn;
+                }
+            }
+        }
+    }
+    UULog(@"switchScreen not found in vtable");
+    return NULL;
 }
 
 static void UUSwitchToDisplay(UIView *toolBar, NSInteger index) {
     void *fn = UUSwitchScreenFunction();
     if (!fn) {
-        UUToast([NSString stringWithFormat:@"UUScreenSwitch 仅适配 UU远程 %@", kTargetVersion]);
+        UUToast(@"未找到切屏入口");
         return;
     }
 
@@ -192,7 +263,6 @@ static void UUSwitchToDisplay(UIView *toolBar, NSInteger index) {
         return;
     }
     if (raw & 0xC000000000000001ULL) {
-        // 非 native 存储（桥接 NSArray），4.42.0 实际不会出现；为安全起见不处理
         UULog(@"screenInfos is not native storage: 0x%lx", (unsigned long)raw);
         UUToast(@"屏幕列表格式异常");
         return;
@@ -323,7 +393,7 @@ static void UUCollectItems(UIView *v, Class itemCls, NSMutableArray *out, int de
 }
 
 static void UUUpdateToolBar(UIView *toolBar) {
-    Class itemCls = objc_getClass(kClsItem);
+    Class itemCls = UUItemClass();
     if (!itemCls) return;
     NSMutableArray<UIView *> *items = [NSMutableArray array];
     UUCollectItems(toolBar, itemCls, items, 0);
@@ -364,7 +434,7 @@ static void hook_didClickButton(UIView *self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[UIGestureRecognizer class]]) v = ((UIGestureRecognizer *)sender).view;
     else if ([sender isKindOfClass:[UIView class]]) v = sender;
 
-    Class itemCls = objc_getClass(kClsItem);
+    Class itemCls = UUItemClass();
     for (int d = 0; v && v != self && d < 6; d++, v = v.superview) {
         if (itemCls && [v isKindOfClass:itemCls]) {
             NSNumber *idx = objc_getAssociatedObject(v, &kAssocDisplayIndex);
