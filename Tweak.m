@@ -5,6 +5,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <string.h>
@@ -26,9 +27,36 @@ static const char *kClsSession   = "_TtC14nrd_ios_client23RemoteConnectionSessio
 static const char *kClsScreen    = "StreamerScreenSourceModel";
 
 static char kAssocDisplayIndex;   // NSNumber: 0 / 1 / -1(不处理)
+static char kAssocNormalColor;    // UIColor: 按钮原始文字/图标颜色
+static char kAssocActiveIndex;    // NSNumber: session 当前选中的屏幕索引兜底
+static char kAssocToolBarWatcher; // UUToolBarWatcher: 定时同步多屏菜单切换状态
 
 static IMP sOrigLayout   = NULL;
 static IMP sOrigDidClick = NULL;
+
+static void UUUpdateToolBar(UIView *toolBar);
+
+@interface UUToolBarWatcher : NSObject
+@property (nonatomic, weak) UIView *toolBar;
+@property (nonatomic, strong) NSTimer *timer;
+@end
+
+@implementation UUToolBarWatcher
+- (void)tick:(NSTimer *)timer {
+    UIView *tb = self.toolBar;
+    if (!tb) {
+        [timer invalidate];
+        self.timer = nil;
+        return;
+    }
+    if (tb.window && !tb.hidden && tb.alpha > 0.01) {
+        UUUpdateToolBar(tb);
+    }
+}
+- (void)dealloc {
+    [_timer invalidate];
+}
+@end
 
 static Class UUItemClass(void) {
     static Class cls = Nil;
@@ -127,6 +155,12 @@ static id UUSearchVCTree(UIViewController *vc, Class vmCls, int depth) {
 static id UUFindViewModel(UIView *from) {
     Class vmCls = objc_getClass(kClsViewModel);
     if (!vmCls) return nil;
+    // 0. RemoteToolBar 自带 contentViewController ivar
+    id cvc = UUObjectIvar(from, "contentViewController");
+    if ([cvc isKindOfClass:[UIViewController class]]) {
+        id vm = UUViewModelFromVC((UIViewController *)cvc, vmCls);
+        if (vm) return vm;
+    }
     // 1. 工具栏的响应链，正常会走到 ControlPanelViewController
     for (UIResponder *r = from; r; r = r.nextResponder) {
         if ([r isKindOfClass:[UIViewController class]]) {
@@ -143,6 +177,71 @@ static id UUFindViewModel(UIView *from) {
         }
     }
     return nil;
+}
+
+static int32_t UUScreenID(id screen) {
+    if (!screen) return -1;
+    SEL sel = sel_registerName("screen_id");
+    if ([screen respondsToSelector:sel]) {
+        return ((int32_t (*)(id, SEL))objc_msgSend)(screen, sel);
+    }
+    int32_t sid = -1;
+    if (UURawIvar(screen, "_screen_id", &sid, sizeof(sid))) return sid;
+    return -1;
+}
+
+// 获取当前激活的显示器索引（0 = 显示器1，1 = 显示器2）
+static NSInteger UUCurrentDisplayIndex(UIView *toolBar) {
+    id vm = UUFindViewModel(toolBar);
+    if (!vm) return 0;
+    id session = UUObjectIvar(vm, "session");
+    Class sessionCls = objc_getClass(kClsSession);
+    if (!session || !sessionCls || ![session isKindOfClass:sessionCls]) return 0;
+
+    uintptr_t raw = 0;
+    if (!UURawIvar(session, "screenInfos", &raw, sizeof(raw)) || raw == 0 || (raw & 0xC000000000000001ULL)) {
+        NSNumber *saved = objc_getAssociatedObject(session, &kAssocActiveIndex);
+        return saved ? saved.integerValue : 0;
+    }
+    NSInteger count = *(NSInteger *)(raw + 0x10);
+    if (count <= 0 || count > 16) return 0;
+
+    // 1. 优先读取 session.$__lazy_storage_$_currentScreenInfo（官方多屏菜单与 switchScreen 同步更新该字段）
+    id curScreen = UUObjectIvar(session, "$__lazy_storage_$_currentScreenInfo");
+    if (curScreen) {
+        int32_t curID = UUScreenID(curScreen);
+        for (NSInteger i = 0; i < count; i++) {
+            id s = (__bridge id)(*(void **)(raw + 0x20 + (uintptr_t)i * sizeof(void *)));
+            if (!s) continue;
+            if (s == curScreen || (curID >= 0 && UUScreenID(s) == curID)) {
+                objc_setAssociatedObject(session, &kAssocActiveIndex, @(i), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return i;
+            }
+        }
+    }
+
+    // 2. 次选读取 session.currentScreenID（Swift Int32?：前 4 字节为值，第 5 字节 bit0=0 表示有值）
+    uint8_t rawCurID[5] = {0, 0, 0, 0, 1};
+    if (UURawIvar(session, "currentScreenID", rawCurID, sizeof(rawCurID)) && (rawCurID[4] & 1) == 0) {
+        int32_t sid = -1;
+        memcpy(&sid, rawCurID, sizeof(sid));
+        if (sid >= 0) {
+            for (NSInteger i = 0; i < count; i++) {
+                id s = (__bridge id)(*(void **)(raw + 0x20 + (uintptr_t)i * sizeof(void *)));
+                if (s && UUScreenID(s) == sid) {
+                    objc_setAssociatedObject(session, &kAssocActiveIndex, @(i), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    return i;
+                }
+            }
+        }
+    }
+
+    // 3. 尚未触发过切屏时（与官方 ToolsScreenDisplayViewViewController 逻辑一致，默认选中第 0 块屏幕）
+    NSNumber *saved = objc_getAssociatedObject(session, &kAssocActiveIndex);
+    if (saved && saved.integerValue >= 0 && saved.integerValue < count) {
+        return saved.integerValue;
+    }
+    return 0;
 }
 
 // ---- 切屏（通过 Swift 虚表动态定位，不限制 App 版本） ----------------------
@@ -284,13 +383,19 @@ static void UUSwitchToDisplay(UIView *toolBar, NSInteger index) {
 
     UULog(@"switch -> display %ld / %ld (vm=%p screen=%p)", (long)index + 1, (long)count,
           (__bridge void *)vm, (__bridge void *)screen);
+    objc_setAssociatedObject(session, &kAssocActiveIndex, @(index), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // vm / screen 在本作用域内被强引用持有，满足 Swift guaranteed 参数约定
     uuss_call_swift_method(fn, (__bridge void *)vm, (__bridge void *)screen);
+    UUUpdateToolBar(toolBar);
 
     [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
 }
 
 // ---- 工具栏按钮改造 -----------------------------------------------------------
+
+static UIColor *UUActiveBlueColor(void) {
+    return [UIColor colorWithRed:58.0 / 255.0 green:123.0 / 255.0 blue:251.0 / 255.0 alpha:1.0];
+}
 
 static UILabel *UUFirstLabel(UIView *v) {
     if ([v isKindOfClass:[UILabel class]]) return (UILabel *)v;
@@ -345,7 +450,7 @@ static UIImage *UUDisplayIcon(NSInteger index, CGSize size, UIColor *color) {
     UIImage *sym = [[UIImage systemImageNamed:@"display" withConfiguration:cfg]
                     imageWithTintColor:color renderingMode:UIImageRenderingModeAlwaysOriginal];
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:size];
-    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         CGSize ss = sym.size;
         CGFloat scale = MIN(size.width / ss.width, size.height / ss.height);
         CGSize ds = CGSizeMake(ss.width * scale, ss.height * scale);
@@ -362,23 +467,33 @@ static UIImage *UUDisplayIcon(NSInteger index, CGSize size, UIColor *color) {
         [num drawAtPoint:CGPointMake(CGRectGetMidX(rect) - ns.width / 2, screenMidY - ns.height / 2)
           withAttributes:attr];
     }];
+    return [img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
 }
 
-static void UUStyleItem(UIView *item, NSInteger index) {
+static void UUStyleItem(UIView *item, NSInteger index, BOOL active) {
     NSString *title = [NSString stringWithFormat:@"显示器%ld", (long)index + 1];
     UILabel *label = UUItemLabel(item);
-    if (label && ![label.text isEqualToString:title]) label.text = title;
+    UIColor *normalColor = objc_getAssociatedObject(item, &kAssocNormalColor);
+    if (!normalColor) {
+        normalColor = (label && label.textColor) ? label.textColor : UIColor.whiteColor;
+        objc_setAssociatedObject(item, &kAssocNormalColor, normalColor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    UIColor *targetColor = active ? UUActiveBlueColor() : normalColor;
+
+    if (label) {
+        if (![label.text isEqualToString:title]) label.text = title;
+        if (![label.textColor isEqual:targetColor]) label.textColor = targetColor;
+    }
 
     UIImageView *icon = UUItemIcon(item);
     if (icon) {
-        NSNumber *done = objc_getAssociatedObject(icon, &kAssocDisplayIndex);
-        if (!done || done.integerValue != index || icon.image.accessibilityIdentifier == nil) {
+        NSString *stateTag = [NSString stringWithFormat:@"UUScreenSwitch_%ld_%d", (long)index, active ? 1 : 0];
+        if (![icon.image.accessibilityIdentifier isEqualToString:stateTag]) {
             CGSize size = icon.image ? icon.image.size : icon.bounds.size;
-            UIColor *color = label.textColor ?: UIColor.whiteColor;
-            UIImage *img = UUDisplayIcon(index, size, color);
-            img.accessibilityIdentifier = @"UUScreenSwitch";
+            UIImage *img = UUDisplayIcon(index, size, targetColor);
+            img.accessibilityIdentifier = stateTag;
             icon.image = img;
-            objc_setAssociatedObject(icon, &kAssocDisplayIndex, @(index), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            icon.tintColor = targetColor;
         }
     }
     item.accessibilityLabel = title;
@@ -392,12 +507,28 @@ static void UUCollectItems(UIView *v, Class itemCls, NSMutableArray *out, int de
     }
 }
 
+static void UUEnsureWatcher(UIView *toolBar) {
+    UUToolBarWatcher *watcher = objc_getAssociatedObject(toolBar, &kAssocToolBarWatcher);
+    if (!watcher) {
+        watcher = [UUToolBarWatcher new];
+        watcher.toolBar = toolBar;
+        watcher.timer = [NSTimer scheduledTimerWithTimeInterval:0.4
+                                                         target:watcher
+                                                       selector:@selector(tick:)
+                                                       userInfo:nil
+                                                        repeats:YES];
+        objc_setAssociatedObject(toolBar, &kAssocToolBarWatcher, watcher, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 static void UUUpdateToolBar(UIView *toolBar) {
     Class itemCls = UUItemClass();
     if (!itemCls) return;
+    UUEnsureWatcher(toolBar);
     NSMutableArray<UIView *> *items = [NSMutableArray array];
     UUCollectItems(toolBar, itemCls, items, 0);
 
+    NSInteger activeIndex = UUCurrentDisplayIndex(toolBar);
     BOOL used[2] = {NO, NO};
     for (UIView *item in items) {
         NSNumber *idx = objc_getAssociatedObject(item, &kAssocDisplayIndex);
@@ -413,7 +544,7 @@ static void UUUpdateToolBar(UIView *toolBar) {
         NSInteger i = idx.integerValue;
         if (i == 0 || i == 1) {
             used[i] = YES;
-            UUStyleItem(item, i);
+            UUStyleItem(item, i, (i == activeIndex));
         }
     }
 }
