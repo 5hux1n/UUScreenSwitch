@@ -21,7 +21,7 @@ make package THEOS=/Users/manjunhong/theos THEOS_PACKAGE_SCHEME=rootless \
     THEOS_PACKAGE_DIR="$BUILD_TMP/rootless"
 RL_DEB="$(find "$BUILD_TMP/rootless" -maxdepth 1 -name '*.deb' -print -quit)"
 VER="$(/opt/homebrew/bin/dpkg-deb -f "$RL_DEB" Version)"
-cp "$RL_DEB" "dist/uuhelper_${VER}_arm64.deb"
+cp "$RL_DEB" "dist/UUScreenSwitch_${VER}_arm64.deb"
 
 # 2. RootHide (iphoneos-arm64e, native roothide)
 make clean THEOS=/Users/manjunhong/theos-roothide THEOS_PACKAGE_SCHEME=roothide >/dev/null
@@ -30,10 +30,10 @@ make package THEOS=/Users/manjunhong/theos-roothide THEOS_PACKAGE_SCHEME=roothid
     THEOS_PACKAGE_DIR="$BUILD_TMP/roothide"
 RH_DEB="$(find "$BUILD_TMP/roothide" -maxdepth 1 -name '*.deb' -print -quit)"
 VER_RH="$(/opt/homebrew/bin/dpkg-deb -f "$RH_DEB" Version)"
-cp "$RH_DEB" "dist/uuhelper_${VER_RH}_arm64e.deb"
+cp "$RH_DEB" "dist/UUScreenSwitch_${VER_RH}_arm64e.deb"
 
 # 3. Verification checklist (package skill §5)
-python3 - "$ROOT/dist/uuhelper_${VER}_arm64.deb" "$ROOT/dist/uuhelper_${VER_RH}_arm64e.deb" <<'PY'
+python3 - "$ROOT/dist/UUScreenSwitch_${VER}_arm64.deb" "$ROOT/dist/UUScreenSwitch_${VER_RH}_arm64e.deb" <<'PY'
 import subprocess, sys, tempfile, pathlib
 
 rl_deb, rh_deb = [pathlib.Path(p) for p in sys.argv[1:3]]
@@ -66,6 +66,6 @@ def check_deb(deb, expect_pkg, expect_arch, expect_prefix, expect_rpath):
             assert s.encode('utf-8') in data or s.encode('utf-16-le') in data, f"Missing string {s}"
     print(f"[OK] {deb.name}: Package={fields['Package']} Arch={fields['Architecture']} Version={fields['Version']}")
 
-check_deb(rl_deb, 'uuhelper', 'iphoneos-arm64', '/var/jb', False)
-check_deb(rh_deb, 'uuhelper.roothide', 'iphoneos-arm64e', '/', True)
+check_deb(rl_deb, 'im.mjh.uuscreenswitch', 'iphoneos-arm64', '/var/jb', False)
+check_deb(rh_deb, 'im.mjh.uuscreenswitch.roothide', 'iphoneos-arm64e', '/', True)
 PY
