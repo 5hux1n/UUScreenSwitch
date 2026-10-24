@@ -457,6 +457,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
 @property (nonatomic) int32_t targetID;
 @property (nonatomic) CFTimeInterval started;
 @property (nonatomic) BOOL applying;
+@property (nonatomic) BOOL restoringForeground;
 - (void)stop;
 - (void)start;
 - (void)willResign:(NSNotification *)note;
@@ -482,6 +483,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
         CFRelease(_observer);
         _observer = NULL;
     }
+    self.restoringForeground = NO;
     self.pending = nil;
     self.lastApplied = nil;
     self.source = nil;
@@ -491,7 +493,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
 }
 - (void)start {
     __weak UUViewportMemory *weakMemory = self;
-    _observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault,
+    if (!self.restoringForeground) _observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault,
         kCFRunLoopBeforeWaiting | kCFRunLoopExit, YES, -1000, ^(CFRunLoopObserverRef observer, CFRunLoopActivity activity) {
             [weakMemory tick:nil];
         });
@@ -506,7 +508,11 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     UURefreshViewportBindings(self);
     UUViewportSnapshot *snapshot = [UUViewportSnapshot new];
     int32_t sid = UUViewportCurrentScreenID(self.session);
-    if (sid >= 0 && (!self.pending || self.lastApplied) && UUReadViewport(self.content, snapshot)) {
+    UUViewportSnapshot *desired = sid == self.targetID ? self.pending :
+        (sid == self.sourceID ? self.source : nil);
+    if (sid >= 0 && desired) {
+        self.screens[@(sid)] = desired;
+    } else if (sid >= 0 && UUReadViewport(self.content, snapshot)) {
         self.screens[@(sid)] = snapshot;
     }
     [self stop];
@@ -519,6 +525,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     UUViewportSnapshot *saved = self.screens[@(sid)];
     [self stop];
     if (!saved || !self.content || !self.session) return;
+    self.restoringForeground = YES;
     self.pending = self.source = saved;
     self.targetID = self.sourceID = sid;
     self.started = CACurrentMediaTime();
@@ -531,7 +538,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     UIView *view = self.content;
     id session = self.session;
     CFTimeInterval now = CACurrentMediaTime();
-    if (!session || now - self.started > 3.0 ||
+    if (!session || (!self.restoringForeground && now - self.started > 3.0) ||
         objc_getAssociatedObject(view, kUUAssocViewportMemory()) != self) { [self stop]; return; }
     if (!view.window) return;
     int32_t currentID = UUViewportCurrentScreenID(session);
@@ -565,6 +572,11 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
         if (UUReadViewport(view, applied)) {
             self.lastApplied = applied;
             self.lastDesired = desired;
+            if (self.restoringForeground) {
+                // Layout/render hooks keep guarding late resets without an idle polling timer.
+                [self.timer invalidate];
+                self.timer = nil;
+            }
         }
     }
 }
@@ -623,6 +635,24 @@ static void hook_render_transform(id self, SEL cmd, id view, uint64_t handle,
 static void hook_content_layout(UIView *self, SEL _cmd) {
     if (sOrigContentLayout) ((void (*)(id, SEL))sOrigContentLayout)(self, _cmd);
     UUViewportMemory *memory = objc_getAssociatedObject(self, kUUAssocViewportMemory());
+    if (!memory) {
+        id vm = UUFindViewModel(self);
+        id session = UUObjectIvar(vm, "session");
+        UIViewController *vc = UUObjectIvar(vm, "contentViewController");
+        void *zoom = NULL, *offset = NULL;
+        if (session && UUObjectIvar(vc, "$__lazy_storage_$_remoteContentView") == self &&
+            UUViewportFunctions(&zoom, &offset)) {
+            memory = objc_getAssociatedObject(session, kUUAssocViewportMemory());
+            if (!memory) {
+                memory = [UUViewportMemory new];
+                memory.session = session;
+                objc_setAssociatedObject(session, kUUAssocViewportMemory(), memory, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            memory.viewModel = vm;
+            memory.content = self;
+            UURefreshViewportBindings(memory);
+        }
+    }
     [memory tick:nil];
 }
 

@@ -16,16 +16,20 @@ UU 远程 iOS 客户端快捷切屏插件，支持 iOS 15.0 及以上。将默�
 
 ## 安装
 
-正式版本：**1.0.2**。包名：`im.mjh.uuscreenswitch`（RootHide 为 `im.mjh.uuscreenswitch.roothide`）。
+正式版本：**1.0.3**。包名：`im.mjh.uuscreenswitch`（RootHide 为 `im.mjh.uuscreenswitch.roothide`）。
 
 | 环境 | 下载 |
 |---|---|
-| Rootless | [UUScreenSwitch_1.0.2_arm64.deb](https://github.com/5hux1n/UUScreenSwitch/releases/download/v1.0.2/UUScreenSwitch_1.0.2_arm64.deb) |
-| RootHide | [UUScreenSwitch_1.0.2_arm64e.deb](https://github.com/5hux1n/UUScreenSwitch/releases/download/v1.0.2/UUScreenSwitch_1.0.2_arm64e.deb) |
+| Rootless | [UUScreenSwitch_1.0.3_arm64.deb](https://github.com/5hux1n/UUScreenSwitch/releases/download/v1.0.3/UUScreenSwitch_1.0.3_arm64.deb) |
+| RootHide | [UUScreenSwitch_1.0.3_arm64e.deb](https://github.com/5hux1n/UUScreenSwitch/releases/download/v1.0.3/UUScreenSwitch_1.0.3_arm64e.deb) |
 
 可通过个人插件源 [apt.mjh.im](https://apt.mjh.im/) 直接添加安装。
 
 ## 更新日志
+
+### 1.0.3
+- 修复切回前台后屏幕缩放和定位失效的问题。
+
 
 ### 1.0.2
 - 新增各显示器视角记忆与定位修复：切换显示器时自动记住缩放和偏移，切回时精准恢复，支持应用进入后台返回后恢复视角。

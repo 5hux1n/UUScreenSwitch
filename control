@@ -1,6 +1,6 @@
 Package: im.mjh.uuscreenswitch
 Name: UU远控切屏
-Version: 1.0.2
+Version: 1.0.3
 Architecture: iphoneos-arm64
 Description: 把默认控制菜单里的展开全部窗口和显示桌面替换为直接切换显示器，适合双显示器用户。
 Maintainer: junhong
